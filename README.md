@@ -1,0 +1,2 @@
+# CheckInFirmwareForCardputerAdv
+存储适用于CardputerAdv的打卡固件的源代码，仅供个人学习使用
