@@ -3,6 +3,7 @@
 #include <M5Cardputer.h>
 #include "config.h"
 #include "profile.h"
+#include "checkin.h"  // timeValid() / greetingText()
 
 inline int uiScrW() { return M5Cardputer.Display.width(); }
 inline int uiScrH() { return M5Cardputer.Display.height(); }
@@ -23,6 +24,31 @@ inline void uiBeep(bool ok) {
   } else {
     M5Cardputer.Speaker.tone(400, 250);
   }
+}
+
+// 18 点未打卡提醒音（扬声器，同 uiBeep 的 Speaker.tone 方式）：两声各 0.5 秒，间隔 0.3 秒
+inline void uiReminderBeep() {
+  M5Cardputer.Speaker.tone(2000, 500);
+  delay(800);  // 0.5s 声音 + 0.3s 间隔（tone 为后台播放，第二声发出即完成）
+  M5Cardputer.Speaker.tone(2000, 500);
+}
+
+// 提醒页：按要求只显示这一行字
+inline void uiDrawReminder() {
+  auto& d = M5Cardputer.Display;
+  d.fillScreen(TFT_BLACK);
+  d.setFont(&fonts::efontCN_24);
+  d.setTextColor(TFT_ORANGE, TFT_BLACK);
+  d.drawString("不要忘记打卡哦", uiScrW() / 2, uiScrH() / 2);
+}
+
+// 省电模式：整屏只显示时间
+inline void uiDrawPowerSave(const String& hhmmss) {
+  auto& d = M5Cardputer.Display;
+  d.fillScreen(TFT_BLACK);
+  d.setFont(&fonts::efontCN_24);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString(hhmmss, uiScrW() / 2, uiScrH() / 2);
 }
 
 inline void uiDrawConnecting(const String& ssid) {
@@ -83,15 +109,21 @@ inline void uiDrawMain() {
   auto& d = M5Cardputer.Display;
   d.fillScreen(TFT_BLACK);
 
-  String top = greetingText() + "，" + (g_profile.name.length() ? g_profile.name : "朋友");
+  // 时间未同步时不用真实问候（formatNow 还是 1970 年的时段）
+  String top = (timeValid() ? greetingText() : String("你好")) + "，" +
+               (g_profile.name.length() ? g_profile.name : "朋友");
   d.setFont(&fonts::efontCN_16);
   d.setTextColor(TFT_YELLOW, TFT_BLACK);
   d.drawString(top, uiScrW() / 2, 18);
 
-  uiDrawTimeBox(formatNow("%H:%M:%S"));
+  uiDrawTimeBox(timeValid() ? formatNow("%H:%M:%S") : "--:--:--");
 
   d.setFont(&fonts::efontCN_16);
-  if (!profileComplete()) {
+  if (!timeValid()) {
+    // 开机 NTP 未同步前不显示打卡状态：否则会用 1970 年日期误判为“未打卡”
+    d.setTextColor(TFT_CYAN, TFT_BLACK);
+    d.drawString("正在同步时间 …", uiScrW() / 2, 92);
+  } else if (!profileComplete()) {
     d.setTextColor(TFT_ORANGE, TFT_BLACK);
     d.drawString("请先填写资料", uiScrW() / 2, 92);
   } else if (g_profile.lastDate == formatNow("%Y-%m-%d")) {
@@ -110,7 +142,7 @@ inline void uiDrawMain() {
 }
 
 inline void uiTickMain() {
-  uiDrawTimeBox(formatNow("%H:%M:%S"));
+  uiDrawTimeBox(timeValid() ? formatNow("%H:%M:%S") : "--:--:--");
 }
 
 inline void uiDrawChecking() {

@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "1.0a"
+#define FW_VERSION "1.1a"
 
 // 出厂默认 WiFi（编译期烧录；设备只会以 STA 方式连接其他 WiFi，无热点模式）
 #define DEFAULT_WIFI_SSID ""

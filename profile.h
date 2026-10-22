@@ -26,6 +26,7 @@ inline bool g_sdOk = false;
 #define SD_WIFI     SD_DIR "/wifi.txt"
 #define SD_PROFILE  SD_DIR "/profile.txt"
 #define SD_WIFI_BK  SD_DIR "/wifi_bk.txt"
+#define SD_CHECKIN  SD_DIR "/checkin.txt"  // 当天打卡记录："YYYY-MM-DD HH:MM:SS"，仅当天有效
 
 inline bool sdInit() {
   SPI.begin(40, 39, 14, 12);
@@ -209,6 +210,35 @@ inline String backupPass() {
     if (nl >= 0) return cleanLine(body.substring(nl + 1));
   }
   return g_prefs.getString("bk_pass", "");
+}
+
+// ---- 当天打卡记录（/CheckInInfo/checkin.txt，仅当天有效）----
+
+// 写入打卡记录：SD 为主，NVS 兜底（无 SD 卡时仍可恢复）
+inline bool checkinRecordWrite(const String& date, const String& timeStr) {
+  String line = date + " " + timeStr;
+  g_prefs.putString("last_checkin", line);
+  if (!g_sdOk) return false;
+  if (!SD.exists(SD_DIR)) SD.mkdir(SD_DIR);
+  bool ok = sdWriteFile(SD_CHECKIN, line + "\n");
+  if (!ok) Serial.println("[checkin] 打卡记录写入 SD 失败");
+  return ok;
+}
+
+// 取记录中的日期（"YYYY-MM-DD"），无记录或记录损坏返回 ""
+inline String checkinRecordDate() {
+  String raw;
+  if (g_sdOk && SD.exists(SD_CHECKIN)) raw = sdReadFile(SD_CHECKIN);
+  raw = cleanLine(raw);
+  if (raw.length() < 10) raw = cleanLine(g_prefs.getString("last_checkin", ""));
+  if (raw.length() < 10) return "";
+  return raw.substring(0, 10);
+}
+
+// 清除打卡记录（过期/跨天时调用，保证“仅当天有效”）
+inline void checkinRecordClear() {
+  g_prefs.remove("last_checkin");
+  if (g_sdOk && SD.exists(SD_CHECKIN)) SD.remove(SD_CHECKIN);
 }
 
 inline bool profileComplete() {

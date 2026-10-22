@@ -6,11 +6,18 @@
 #include "net.h"
 #include "ui.h"
 
-enum class Screen { Main, Message, WiFiList, WiFiSsid, WiFiPass };
+enum class Screen { Main, Message, WiFiList, WiFiSsid, WiFiPass, Reminder, PowerSave };
 static Screen g_screen = Screen::Main;
 static unsigned long g_msgSince = 0;
 static unsigned long g_lastTick = 0;
 static String g_dateKey;  // 当前本地日期，跨天（0点）时用于重置打卡状态
+static bool g_timeWasValid = false;  // NTP 是否已完成首次同步
+static String g_remindedDate;  // 已触发过 18 点提醒的日期（每天只提醒一次）
+// 省电模式状态
+static Screen g_prevScreen = Screen::Main;   // 进省电前所在界面（退出时恢复）
+static uint8_t g_prevBright = 255;           // 进省电前的亮度
+static unsigned long g_sleepTick = 0;        // 省电界面时间刷新
+static unsigned long g_lastActivity = 0;     // 最后一次按键/操作时间
 
 static std::vector<String> g_apList;
 static int g_wifiSel = 0;
@@ -27,6 +34,53 @@ static void showMessage(const String& title, const String& body, bool ok) {
 static void showMain() {
   uiDrawMain();
   g_screen = Screen::Main;
+  g_lastActivity = millis();  // 返回主界面，重新计算“10 秒无操作”
+}
+
+// 进入省电模式：亮度降到 10%，整屏只显示时间
+static void enterPowerSave() {
+  g_prevScreen = g_screen;
+  g_prevBright = M5Cardputer.Display.getBrightness();
+  uint8_t dim = g_prevBright / 10;      // 10% 亮度
+  if (dim < 3) dim = 3;                 // 保底可见
+  M5Cardputer.Display.setBrightness(dim);
+  uiDrawPowerSave(timeValid() ? formatNow("%H:%M:%S") : "--:--:--");
+  g_screen = Screen::PowerSave;
+  g_sleepTick = millis();
+  Serial.println("[power] 进入省电模式");
+}
+
+// 退出省电：恢复亮度，回到进入前的界面
+static void exitPowerSave() {
+  M5Cardputer.Display.setBrightness(g_prevBright);
+  switch (g_prevScreen) {
+    case Screen::WiFiList:
+      g_screen = Screen::WiFiList;
+      uiDrawWifiList(g_wifiSel, "", g_apList);
+      break;
+    case Screen::WiFiSsid:
+      g_screen = Screen::WiFiSsid;
+      uiDrawWifiInput("", g_cfgInput, false, "");
+      break;
+    case Screen::WiFiPass:
+      g_screen = Screen::WiFiPass;
+      uiDrawWifiInput(g_cfgSsid, g_cfgInput, true, "");
+      break;
+    default:  // Main / Message / Reminder 统一回主界面
+      showMain();
+      break;
+  }
+  g_lastActivity = millis();
+  Serial.println("[power] 退出省电模式");
+}
+
+// 18 点未打卡提醒：全屏只显示提醒语 + 扬声器响两声（Speaker.tone，同打卡成功音效），回车直接打卡
+static void showReminder() {
+  uiDrawReminder();
+  uiReminderBeep();  // 约 1.3 秒：0.5s 声 + 0.3s 间隔 + 0.5s 声
+  g_screen = Screen::Reminder;
+  g_remindedDate = formatNow("%Y-%m-%d");
+  Serial.println("[checkin] 18:00 未打卡提醒已触发");
 }
 
 static void enterAfterConnect() {
@@ -176,13 +230,13 @@ static void doCheckin() {
     showMessage("资料未填", String("请手机打开 ") + MDNS_URL + " 填写资料", false);
     return;
   }
+  if (!timeValid()) {  // 必须先于日期比较：时间未同步时 formatNow 是 1970 年
+    showMessage("时间未同步", "请检查网络后重试", false);
+    return;
+  }
   String today = formatNow("%Y-%m-%d");
   if (g_profile.lastDate == today) {
     showMessage("无需打卡", "今天已经打卡过了", true);
-    return;
-  }
-  if (!timeValid()) {
-    showMessage("时间未同步", "请检查网络后重试", false);
     return;
   }
 
@@ -191,6 +245,7 @@ static void doCheckin() {
   if (r.ok) {
     g_profile.lastDate = today;
     profileSave();
+    checkinRecordWrite(today, formatNow("%H:%M:%S"));  // 独立打卡记录，仅当天有效
     uiBeep(true);
     showMessage("打卡成功", r.msg, true);
   } else {
@@ -219,20 +274,63 @@ void setup() {
 
 void loop() {
   M5Cardputer.update();
+  // 键盘与 Go 键（顶部 G0 按钮）统一检测，任何操作都刷新“最后活动时间”
+  bool keyEvent = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
+  bool goPressed = M5Cardputer.BtnA.wasPressed();
+  if (keyEvent || goPressed) g_lastActivity = millis();
+  bool powerEntered = false;
+  if (goPressed && g_screen != Screen::PowerSave) {  // Go 键随时进入省电模式
+    enterPowerSave();
+    powerEntered = true;
+  }
   netLoop();
 
-  // 跨天检测：本地 0 点后重置打卡状态并刷新主界面状态栏。
-  // 这里只清内存、不落盘：重新上电会读回上次打卡日期，
-  // 与今天日期比较必然不等，判定结果一致（未打卡）。
+  // 时间同步与跨天处理
   if (timeValid()) {
     String today = formatNow("%Y-%m-%d");
-    if (g_dateKey.length() == 0) {
+    int hhmmss = formatNow("%H%M%S").toInt();
+    if (!g_timeWasValid) {
+      // 开机 NTP 首次同步完成：应用打卡记录（仅当天有效）并重绘主界面。
+      // 否则开机瞬间主界面是用 1970 年日期画的，会误显示“未打卡”。
+      g_timeWasValid = true;
       g_dateKey = today;
+      String rec = checkinRecordDate();
+      if (rec == today) {
+        if (g_profile.lastDate != today) {  // 有当天记录但存档缺失 -> 回填
+          g_profile.lastDate = today;
+          profileSave();
+        }
+      } else if (rec.length() > 0) {
+        checkinRecordClear();  // 记录不是今天的：仅当天有效，作废
+        if (g_profile.lastDate == rec) {
+          g_profile.lastDate = "";
+          profileSave();
+        }
+      }
+      if (g_screen == Screen::Main) uiDrawMain();
     } else if (today != g_dateKey) {
+      // 跨天（本地 0 点）：删除当天打卡记录文件（仅当天有效），
+      // lastDate 只清内存不落盘——重新上电读回的日期与今天比必然不等，判定一致。
       g_dateKey = today;
       g_profile.lastDate = "";
+      checkinRecordClear();
+      g_remindedDate = "";  // 新的一天，允许再次触发 18 点提醒
       Serial.printf("[checkin] 跨天重置打卡状态 -> %s\n", today.c_str());
       if (g_screen == Screen::Main) uiDrawMain();
+    }
+
+    // 18:00 仍未打卡 -> 全屏提醒 + 扬声器响两声（每天一次；不打断配网输入）
+    if (g_profile.lastDate != today && g_remindedDate != today &&
+        hhmmss >= 180000 &&
+        (g_screen == Screen::Main || g_screen == Screen::Message)) {
+      showReminder();
+    }
+
+    // 21:00～次日 06:00 且已打卡：主界面 10 秒无操作自动进入省电
+    if (g_screen == Screen::Main && g_profile.lastDate == today &&
+        (hhmmss >= 210000 || hhmmss < 60000) &&
+        millis() - g_lastActivity >= 10000) {
+      enterPowerSave();
     }
   }
 
@@ -242,7 +340,7 @@ void loop() {
         g_lastTick = millis();
         uiTickMain();
       }
-      if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      if (keyEvent) {
         auto& ks = M5Cardputer.Keyboard.keysState();
         if (ks.enter) {
           doCheckin();
@@ -258,26 +356,49 @@ void loop() {
       break;
     }
     case Screen::Message: {
-      bool key = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
-      if (key || millis() - g_msgSince > 4000) {
+      if (keyEvent || millis() - g_msgSince > 4000) {
         showMain();
       }
       break;
     }
+    case Screen::Reminder: {
+      // 回车完成打卡；其它键返回主界面
+      if (keyEvent) {
+        auto& ks = M5Cardputer.Keyboard.keysState();
+        if (ks.enter) {
+          doCheckin();
+        } else {
+          showMain();
+        }
+      }
+      break;
+    }
+    case Screen::PowerSave: {
+      // 每秒刷新时间
+      if (millis() - g_sleepTick >= 1000) {
+        g_sleepTick = millis();
+        if (timeValid()) uiDrawPowerSave(formatNow("%H:%M:%S"));
+      }
+      // 任意键或 Go 键退出（用 Go 进入的这一轮不算退出）
+      if (!powerEntered && (keyEvent || goPressed)) {
+        exitPowerSave();
+      }
+      break;
+    }
     case Screen::WiFiList: {
-      if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      if (keyEvent) {
         wifiListKeys();
       }
       break;
     }
     case Screen::WiFiSsid: {
-      if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      if (keyEvent) {
         wifiSsidKeys();
       }
       break;
     }
     case Screen::WiFiPass: {
-      if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      if (keyEvent) {
         wifiPassKeys();
       }
       break;
