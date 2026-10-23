@@ -14,6 +14,8 @@ inline bool g_scanned = false;
 inline String g_usedSsid;
 inline bool g_usingBackup = false;
 inline bool g_servicesStarted = false;
+inline bool g_mdnsStarted = false;
+inline bool g_webHandlersRegistered = false;
 
 static const char PORTAL_HTML_HEAD[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="zh-CN"><head>
@@ -132,14 +134,29 @@ inline void handleNotFound() {
 }
 
 inline void startStaServices() {
-  if (MDNS.begin(MDNS_HOSTNAME)) {
-    MDNS.addService("http", "tcp", 80);
+  // 幂等：处理器只注册一次；mDNS/服务器在 WiFi 每次恢复连接后重新拉起
+  if (!g_webHandlersRegistered) {
+    g_server.on("/", HTTP_GET, handleRoot);
+    g_server.on("/save", HTTP_POST, handleSave);
+    g_server.onNotFound(handleNotFound);
+    g_webHandlersRegistered = true;
   }
-  g_server.on("/", HTTP_GET, handleRoot);
-  g_server.on("/save", HTTP_POST, handleSave);
-  g_server.onNotFound(handleNotFound);
+  if (g_servicesStarted) g_server.stop();
+  if (g_mdnsStarted) {
+    MDNS.end();
+    g_mdnsStarted = false;
+  }
+  g_mdnsStarted = MDNS.begin(MDNS_HOSTNAME);
+  if (g_mdnsStarted) MDNS.addService("http", "tcp", 80);
   g_server.begin();
   g_servicesStarted = true;
+}
+
+// 打卡成功后关闭 WiFi 省电；之后打卡或按 w 配网时会自动恢复
+inline void wifiOffForPowerSave() {
+  WiFi.disconnect(true);  // 断开并关闭射频
+  g_servicesStarted = false;
+  Serial.println("[net] WiFi 已关闭（打卡后省电模式）");
 }
 
 inline bool tryConnect(const String& ssid, const String& pass) {

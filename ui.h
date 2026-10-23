@@ -16,6 +16,11 @@ inline void uiInit() {
   M5Cardputer.Speaker.setVolume(128);
 }
 
+// 应用用户设置的亮度（10-100% -> 0-255）
+inline void uiApplyBrightness() {
+  M5Cardputer.Display.setBrightness((uint16_t)g_settings.bright * 255 / 100);
+}
+
 inline void uiBeep(bool ok) {
   if (ok) {
     M5Cardputer.Speaker.tone(2000, 100);
@@ -49,6 +54,40 @@ inline void uiDrawPowerSave(const String& hhmmss) {
   d.setFont(&fonts::efontCN_24);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.drawString(hhmmss, uiScrW() / 2, uiScrH() / 2);
+}
+
+// 设置页：亮度 / 省电空闲时间 / 打卡后关WiFi
+inline void uiDrawSettings(int sel) {
+  auto& d = M5Cardputer.Display;
+  d.fillScreen(TFT_BLACK);
+
+  d.setFont(&fonts::efontCN_14);
+  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  d.drawString("设置", uiScrW() / 2, 12);
+
+  String labels[3] = {"亮度", "空闲时间", "打卡后关WiFi"};
+  String values[3];
+  values[0] = String(g_settings.bright) + "%";
+  values[1] = String(settingsIdleSec()) + "秒";
+  values[2] = g_settings.wifiOff ? "开" : "关";
+
+  d.setFont(&fonts::efontCN_12);
+  int y = 46;
+  for (int i = 0; i < 3; i++) {
+    String line = (i == sel ? "> " : "  ") + labels[i] + "  " + values[i];
+    if (i == sel) {
+      d.setTextColor(TFT_YELLOW, TFT_DARKGREY);
+    } else {
+      d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    }
+    d.drawString(line, uiScrW() / 2, y);
+    y += 24;
+  }
+
+  d.setFont(&fonts::efontCN_12);
+  d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  d.drawString(";上.下 ,左/右调整", uiScrW() / 2, uiScrH() - 24);
+  d.drawString("回车保存 · tab取消返回", uiScrW() / 2, uiScrH() - 8);
 }
 
 inline void uiDrawConnecting(const String& ssid) {
@@ -136,9 +175,18 @@ inline void uiDrawMain() {
 
   d.setFont(&fonts::efontCN_12);
   d.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  d.drawString(String("配置页 ") + MDNS_URL, uiScrW() / 2, uiScrH() - 26);
-  d.drawString(WiFi.localIP().toString() + " · 回车打卡 · w改WiFi",
-               uiScrW() / 2, uiScrH() - 10);
+  // WiFi 状态行：已连接显示 SSID 与配置页；已关闭/未连接给出对应提示
+  if (WiFi.status() == WL_CONNECTED) {
+    d.drawString(String("配置页 ") + MDNS_URL, uiScrW() / 2, uiScrH() - 40);
+    String ssid = WiFi.SSID();
+    if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "…";
+    d.drawString("WiFi:" + ssid, uiScrW() / 2, uiScrH() - 26);
+  } else if (WiFi.getMode() == WIFI_OFF) {
+    d.drawString("WiFi:已关闭，回车打卡自动连接", uiScrW() / 2, uiScrH() - 26);
+  } else {
+    d.drawString("WiFi:未连接，按 w 重新配网", uiScrW() / 2, uiScrH() - 26);
+  }
+  d.drawString("回车打卡 · w配网 · i设置", uiScrW() / 2, uiScrH() - 10);
 }
 
 inline void uiTickMain() {
@@ -205,7 +253,7 @@ inline void uiDrawWifiList(int sel, const String& err, const std::vector<String>
 
   d.setFont(&fonts::efontCN_12);
   d.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  d.drawString(";.上下 ,/翻页 · 回车连接 · tab返回", uiScrW() / 2, uiScrH() - 8);
+  d.drawString(";.上下 ,/翻页 r重扫 回车连接 tab返回", uiScrW() / 2, uiScrH() - 8);
 }
 
 inline void uiDrawWifiInput(const String& title, const String& input,

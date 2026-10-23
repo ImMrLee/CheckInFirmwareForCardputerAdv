@@ -6,7 +6,7 @@
 #include "net.h"
 #include "ui.h"
 
-enum class Screen { Main, Message, WiFiList, WiFiSsid, WiFiPass, Reminder, PowerSave };
+enum class Screen { Main, Message, WiFiList, WiFiSsid, WiFiPass, Reminder, PowerSave, Settings };
 static Screen g_screen = Screen::Main;
 static unsigned long g_msgSince = 0;
 static unsigned long g_lastTick = 0;
@@ -18,6 +18,9 @@ static Screen g_prevScreen = Screen::Main;   // 进省电前所在界面（退�
 static uint8_t g_prevBright = 255;           // 进省电前的亮度
 static unsigned long g_sleepTick = 0;        // 省电界面时间刷新
 static unsigned long g_lastActivity = 0;     // 最后一次按键/操作时间
+// 设置页状态
+static int g_setSel = 0;          // 当前选中项
+static Settings g_setOrig;        // 进入设置时的副本（tab 取消时恢复）
 
 static std::vector<String> g_apList;
 static int g_wifiSel = 0;
@@ -34,7 +37,7 @@ static void showMessage(const String& title, const String& body, bool ok) {
 static void showMain() {
   uiDrawMain();
   g_screen = Screen::Main;
-  g_lastActivity = millis();  // 返回主界面，重新计算“10 秒无操作”
+  g_lastActivity = millis();  // 返回主界面，重新计算空闲计时
 }
 
 // 进入省电模式：亮度降到 10%，整屏只显示时间
@@ -132,7 +135,14 @@ static void wifiListKeys() {
   int total = (int)g_apList.size() + 1;
   bool moved = false;
   for (char c : ks.word) {
-    if (c == 'w' || c == 'W' || c == ';') {           // 上
+    if (c == 'r' || c == 'R') {                       // 重新扫描
+      uiDrawScanning();
+      std::vector<String> fresh = scanApList();
+      if (fresh.size() > 0) g_apList = fresh;         // 扫到空则保留旧列表
+      if (g_wifiSel > (int)g_apList.size()) g_wifiSel = 0;
+      redrawWifiList();
+      return;
+    } else if (c == 'w' || c == 'W' || c == ';') {           // 上
       g_wifiSel = (g_wifiSel + total - 1) % total;
       moved = true;
     } else if (c == 's' || c == 'S' || c == '.') {    // 下
@@ -223,6 +233,70 @@ static void wifiPassKeys() {
   if (changed) uiDrawWifiInput(g_cfgSsid, g_cfgInput, true, "");
 }
 
+// ---- 设置页 ----
+
+static void openSettings() {
+  g_setOrig = g_settings;
+  g_setSel = 0;
+  g_screen = Screen::Settings;
+  uiDrawSettings(g_setSel);
+}
+
+static void settingsAdjust(int dir) {
+  switch (g_setSel) {
+    case 0: {  // 亮度 10-100%，步进 10（即时生效）
+      int b = (int)g_settings.bright + dir * 10;
+      if (b < 10) b = 10;
+      if (b > 100) b = 100;
+      g_settings.bright = (uint8_t)b;
+      uiApplyBrightness();
+      break;
+    }
+    case 1: {  // 空闲档位 5/10/30/60/300 秒
+      int i = (int)g_settings.idleIdx + dir;
+      if (i < 0) i = 0;
+      if (i > 4) i = 4;
+      g_settings.idleIdx = (uint8_t)i;
+      break;
+    }
+    case 2:  // 打卡后关 WiFi
+      g_settings.wifiOff = !g_settings.wifiOff;
+      break;
+  }
+}
+
+static void settingsKeys() {
+  auto& ks = M5Cardputer.Keyboard.keysState();
+  if (ks.enter) {
+    settingsSave();
+    showMain();
+    return;
+  }
+  if (ks.tab) {  // 取消：恢复进入设置前的值
+    g_settings = g_setOrig;
+    uiApplyBrightness();
+    showMain();
+    return;
+  }
+  bool changed = false;
+  for (char c : ks.word) {
+    if (c == ';' || c == 'w' || c == 'W') {       // 上一项
+      g_setSel = (g_setSel + 2) % 3;
+      changed = true;
+    } else if (c == '.' || c == 's' || c == 'S') { // 下一项
+      g_setSel = (g_setSel + 1) % 3;
+      changed = true;
+    } else if (c == ',' || c == 'a' || c == 'A') { // 左：值减小
+      settingsAdjust(-1);
+      changed = true;
+    } else if (c == '/' || c == 'd' || c == 'D') { // 右：值增大
+      settingsAdjust(+1);
+      changed = true;
+    }
+  }
+  if (changed) uiDrawSettings(g_setSel);
+}
+
 // ---- 打卡 ----
 
 static void doCheckin() {
@@ -240,12 +314,23 @@ static void doCheckin() {
     return;
   }
 
+  // WiFi 被省电关闭或掉线时，打卡前自动恢复连接
+  if (WiFi.status() != WL_CONNECTED) {
+    uiDrawConnecting(effectiveSsid());
+    if (!wifiConnectSta()) {
+      showMessage("WiFi 未连接", "请按 w 重新配网后重试", false);
+      return;
+    }
+    startStaServices();
+  }
+
   uiDrawChecking();
   CheckinResult r = doCheckinPost();
   if (r.ok) {
     g_profile.lastDate = today;
     profileSave();
     checkinRecordWrite(today, formatNow("%H:%M:%S"));  // 独立打卡记录，仅当天有效
+    if (g_settings.wifiOff) wifiOffForPowerSave();     // 打卡成功后关闭 WiFi 省电
     uiBeep(true);
     showMessage("打卡成功", r.msg, true);
   } else {
@@ -259,6 +344,8 @@ void setup() {
   Serial.begin(115200);
   uiInit();
   profileLoad();
+  settingsLoad();     // 需在 profileLoad 之后（NVS/SD 已就绪）
+  uiApplyBrightness();
   ntpBegin();
 
   if (hasWifiCreds()) {
@@ -319,6 +406,12 @@ void loop() {
       if (g_screen == Screen::Main) uiDrawMain();
     }
 
+    // 打卡后关 WiFi 的重启恢复：同步时间后若当天已打卡，再次关闭 WiFi
+    if (g_settings.wifiOff && WiFi.status() == WL_CONNECTED &&
+        g_profile.lastDate == today) {
+      wifiOffForPowerSave();
+    }
+
     // 18:00 仍未打卡 -> 全屏提醒 + 扬声器响两声（每天一次；不打断配网输入）
     if (g_profile.lastDate != today && g_remindedDate != today &&
         hhmmss >= 180000 &&
@@ -326,10 +419,10 @@ void loop() {
       showReminder();
     }
 
-    // 21:00～次日 06:00 且已打卡：主界面 10 秒无操作自动进入省电
+    // 21:00～次日 06:00 且已打卡：主界面空闲（设置档位，默认 10 秒）无操作自动进入省电
     if (g_screen == Screen::Main && g_profile.lastDate == today &&
         (hhmmss >= 210000 || hhmmss < 60000) &&
-        millis() - g_lastActivity >= 10000) {
+        millis() - g_lastActivity >= (unsigned long)settingsIdleSec() * 1000UL) {
       enterPowerSave();
     }
   }
@@ -348,6 +441,9 @@ void loop() {
           for (char c : ks.word) {
             if (c == 'w' || c == 'W') {
               openWifiConfig(true);
+              return;
+            } else if (c == 'i' || c == 'I') {
+              openSettings();  // i 键进入设置（仅主界面生效）
               return;
             }
           }
@@ -382,6 +478,12 @@ void loop() {
       // 任意键或 Go 键退出（用 Go 进入的这一轮不算退出）
       if (!powerEntered && (keyEvent || goPressed)) {
         exitPowerSave();
+      }
+      break;
+    }
+    case Screen::Settings: {
+      if (keyEvent) {
+        settingsKeys();
       }
       break;
     }

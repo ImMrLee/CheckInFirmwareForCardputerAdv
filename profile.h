@@ -27,6 +27,7 @@ inline bool g_sdOk = false;
 #define SD_PROFILE  SD_DIR "/profile.txt"
 #define SD_WIFI_BK  SD_DIR "/wifi_bk.txt"
 #define SD_CHECKIN  SD_DIR "/checkin.txt"  // 当天打卡记录："YYYY-MM-DD HH:MM:SS"，仅当天有效
+#define SD_SETTINGS SD_DIR "/settings.txt" // 用户设置：亮度/省电空闲时间/打卡后关WiFi
 
 inline bool sdInit() {
   SPI.begin(40, 39, 14, 12);
@@ -239,6 +240,68 @@ inline String checkinRecordDate() {
 inline void checkinRecordClear() {
   g_prefs.remove("last_checkin");
   if (g_sdOk && SD.exists(SD_CHECKIN)) SD.remove(SD_CHECKIN);
+}
+
+// ---- 用户设置（NVS + SD /CheckInInfo/settings.txt 双存储）----
+
+inline const uint16_t SET_IDLE_OPTS[] = {5, 10, 30, 60, 300};  // 省电空闲档位（秒）
+
+struct Settings {
+  uint8_t bright;   // 亮度百分比 10-100，默认 100
+  uint8_t idleIdx;  // 空闲档位下标（SET_IDLE_OPTS），默认 1（10秒）
+  bool wifiOff;     // 打卡成功后关闭 WiFi 省电，默认关
+};
+inline Settings g_settings{100, 1, false};
+
+inline uint16_t settingsIdleSec() { return SET_IDLE_OPTS[g_settings.idleIdx % 5]; }
+
+inline void settingsClamp() {
+  if (g_settings.bright < 10) g_settings.bright = 10;
+  if (g_settings.bright > 100) g_settings.bright = 100;
+  if (g_settings.idleIdx > 4) g_settings.idleIdx = 1;
+}
+
+inline void settingsSave() {
+  g_prefs.putUChar("set_bright", g_settings.bright);
+  g_prefs.putUChar("set_idle", g_settings.idleIdx);
+  g_prefs.putBool("set_wifi_off", g_settings.wifiOff);
+  if (!g_sdOk) return;
+  if (!SD.exists(SD_DIR)) SD.mkdir(SD_DIR);
+  String body;
+  body += "bright=" + String(g_settings.bright) + "\n";
+  body += "idle_idx=" + String(g_settings.idleIdx) + "\n";
+  body += "wifi_off=" + String(g_settings.wifiOff ? 1 : 0) + "\n";
+  sdWriteFile(SD_SETTINGS, body);
+}
+
+// 需在 profileLoad()（NVS begin + SD 初始化）之后调用
+inline void settingsLoad() {
+  // 1) NVS 打底
+  g_settings.bright  = g_prefs.getUChar("set_bright", 100);
+  g_settings.idleIdx = g_prefs.getUChar("set_idle", 1);
+  g_settings.wifiOff = g_prefs.getBool("set_wifi_off", false);
+  settingsClamp();
+  // 2) SD 覆盖
+  if (g_sdOk && SD.exists(SD_SETTINGS)) {
+    String body = sdReadFile(SD_SETTINGS);
+    int pos = 0;
+    while (pos < (int)body.length()) {
+      int nl = body.indexOf('\n', pos);
+      if (nl < 0) nl = body.length();
+      String line = cleanLine(body.substring(pos, nl));
+      pos = nl + 1;
+      int eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      String k = line.substring(0, eq);
+      String v = line.substring(eq + 1);
+      if (k == "bright") g_settings.bright = (uint8_t)v.toInt();
+      else if (k == "idle_idx") g_settings.idleIdx = (uint8_t)v.toInt();
+      else if (k == "wifi_off") g_settings.wifiOff = (v == "1");
+    }
+    settingsClamp();
+  }
+  Serial.printf("[settings] bright=%d%% idle=%ds wifiOff=%d\n",
+                g_settings.bright, settingsIdleSec(), g_settings.wifiOff ? 1 : 0);
 }
 
 inline bool profileComplete() {
